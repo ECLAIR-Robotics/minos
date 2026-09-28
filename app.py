@@ -1,93 +1,64 @@
 import cv2
-import math
 import numpy as np
-from ultralytics import YOLO
 
-# Load YOLOv8 Pose model
-model = YOLO('yolov8n-pose.pt')
 cap = cv2.VideoCapture(0)
-
-window_name = 'YOLO Pose & Fire Detection'
+window_name = 'Dedicated Fire & Smoke Tracker'
 cv2.namedWindow(window_name)
 
-REAL_EYE_DISTANCE_M = 0.063
-FOCAL_LENGTH_PX = 680
-dist_history = []
-SMOOTHING_FRAMES = 5
+# Background subtractor to isolate active movement/flicker
+bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=100, varThreshold=50, detectShadows=False)
 
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
         break
 
-    # --- 1. Fire Detection (HSV Color Space) ---
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    # Blur frame to reduce high-frequency camera noise
+    blurred = cv2.GaussianBlur(frame, (21, 21), 0)
+    
+    # 1. Motion Mask: Fire flickers continuously
+    fg_mask = bg_subtractor.apply(blurred)
+    _, motion_mask = cv2.threshold(fg_mask, 200, 255, cv2.THRESH_BINARY)
 
-    # Define color thresholds for fire (bright red/orange/yellow)
-    lower_fire = np.array([0, 120, 180], dtype=np.uint8)
-    upper_fire = np.array([35, 255, 255], dtype=np.uint8)
+    # 2. Color Mask: Fire RGB/HSV characteristics
+    # Flame condition: Red > Green > Blue and high luminosity
+    hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
+    b, g, r = cv2.split(blurred)
+    
+    # Flame color condition: High Red, Red > Green, Green > Blue, High Value (brightness)
+    rgb_fire = (r > 190) & (g > 100) & (r > g) & (g > b)
+    hsv_fire = (hsv[:, :, 0] <= 25) & (hsv[:, :, 1] >= 100) & (hsv[:, :, 2] >= 180)
+    
+    color_mask = np.uint8(rgb_fire & hsv_fire) * 255
 
-    mask = cv2.inRange(hsv, lower_fire, upper_fire)
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    # 3. Combine Motion AND Color (Fire must be moving AND flame-colored)
+    fire_mask = cv2.bitwise_and(color_mask, motion_mask)
+
+    # Clean up noise with morphological operations
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_OPEN, kernel)
+    fire_mask = cv2.dilate(fire_mask, kernel, iterations=2)
+
+    # Find contours for detected fire regions
+    contours, _ = cv2.findContours(fire_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
     fire_detected = False
     for cnt in contours:
         area = cv2.contourArea(cnt)
-        if area > 800:  # Ignore small light noise
+        if area > 250:  # Ignore tiny specks
             fire_detected = True
-            fx, fy, fw, fh = cv2.boundingRect(cnt)
-            cv2.rectangle(frame, (fx, fy), (fx + fw, fy + fh), (0, 0, 255), 2)
-            cv2.putText(frame, "FIRE DETECTED!", (fx, fy - 10),
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Draw bold red alert box around fire only
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 0, 255), 3)
+            cv2.putText(frame, "FIRE DETECTED", (x, max(y - 10, 20)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
     if fire_detected:
-        cv2.putText(frame, "WARNING: FIRE IN FRAME", (20, 40),
-                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 3)
+        cv2.putText(frame, "WARNING: ACTIVE FLAME IN FRAME", (20, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-    # --- 2. YOLO Person & Pose Tracking ---
-    results = model(frame, conf=0.5, verbose=False)
-    annotated_frame = results[0].plot(img=frame)
-
-    for result in results:
-        if result.boxes is not None and len(result.boxes) > 0:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            keypoints = result.keypoints.data.cpu().numpy() if result.keypoints is not None else []
-
-            for i, box in enumerate(boxes):
-                x1, y1, x2, y2 = map(int, box[:4])
-                box_center_x = int((x1 + x2) / 2)
-                box_center_y = int((y1 + y2) / 2)
-
-                distance_m = 0.0
-                if len(keypoints) > i:
-                    person_kpts = keypoints[i]
-                    left_eye = person_kpts[1]
-                    right_eye = person_kpts[2]
-
-                    if left_eye[2] > 0.5 and right_eye[2] > 0.5:
-                        lx, ly = int(left_eye[0]), int(left_eye[1])
-                        rx, ry = int(right_eye[0]), int(right_eye[1])
-                        eye_pixel_dist = math.sqrt((rx - lx)**2 + (ry - ly)**2)
-
-                        if eye_pixel_dist > 0:
-                            raw_dist = (REAL_EYE_DISTANCE_M * FOCAL_LENGTH_PX) / eye_pixel_dist
-                            dist_history.append(raw_dist)
-                            if len(dist_history) > SMOOTHING_FRAMES:
-                                dist_history.pop(0)
-                            distance_m = sum(dist_history) / len(dist_history)
-
-                cv2.circle(annotated_frame, (box_center_x, box_center_y), 6, (0, 0, 255), -1)
-
-                if distance_m > 0:
-                    distance_ft = distance_m * 3.28084
-                    label = f"Dist: {distance_m:.2f}m ({distance_ft:.1f}ft)"
-                else:
-                    label = "Dist: Detecting..."
-
-                cv2.putText(annotated_frame, label, (box_center_x - 60, box_center_y - 15),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
-    cv2.imshow(window_name, annotated_frame)
+    cv2.imshow(window_name, frame)
 
     key = cv2.waitKey(1) & 0xFF
     if key == ord('q') or cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
