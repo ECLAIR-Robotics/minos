@@ -1,0 +1,10 @@
+{
+  "profiles": {
+    "asus_zenbook": {
+      "focal_length": 4883.33,
+      "default_fire_width_cm": 3.0
+    }
+  },
+  "default_fov_deg": 70.0,
+  "default_fire_width_cm": 3.0
+}
